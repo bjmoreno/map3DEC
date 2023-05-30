@@ -1,0 +1,295 @@
+#clean enviroment
+g <- gc(reset = TRUE); rm(list = ls()); options(scipen = 999, warn = -1, encoding = 'latin1')
+
+setwd("C:/Users/bjm_rog/Documents/R_scrips_bjm/forest_map") # please set path to your working directory
+#install 
+install.packages("remotes")
+remotes::install_github("tylermorganwall/rayshader")
+remotes::install_github("tylermorganwall/rayrender")
+remotes::install_github("dmurdoch/rgl")
+# 0. LOAD PACKAGES
+#-----------------
+
+# libraries we need
+libs <- c(
+  "tidyverse", "terra", "giscoR","rayshader", "rayrender","rgl",
+  "sf", "rayshader"
+)
+# install missing libraries
+installed_libraries <- libs %in% rownames(installed.packages())
+if (any(installed_libraries == F)){
+  install.packages(libs[!installed_libraries])
+}
+# load libraries
+invisible(lapply(libs, library, character.only = T))
+
+# 1. GET COUNTRY MAP
+#-------------------
+
+crsLONGLAT <- "+proj=longlat +datum=WGS84 +no_defs"
+
+get_country_borders <- function() {
+  country_borders <- giscoR::gisco_get_countries(
+    resolution = "10",
+    country = "EC"
+  )
+  return(country_borders)
+}
+
+country_borders <- get_country_borders() |>
+  sf::st_transform(crsLONGLAT)
+
+plot(sf::st_geometry(country_borders))
+
+# 2. GET FOREST COVER
+#--------------------
+
+start_url <- "https://s3-eu-west-1.amazonaws.com/vito.landcover.global/v3.0.1/2019/"
+var_url <- c("W100N20/W100N20", "W100N00/W100N00", "W080N20/W080N20", "W080N00/W080N00")
+end <- "_PROBAV_LC100_global_v3.0.1_2019-nrt_Tree-CoverFraction-layer_EPSG-4326.tif"
+
+urls <- paste0(start_url, var_url, end)
+# Aumentar el tiempo de espera
+options(timeout = 300)
+# Bucle para descargar los archivos
+for (url in urls) {
+  download.file(url, destfile = basename(url), mode = "wb")
+}
+raster_files <- list.files(
+  path = getwd(),
+  pattern = end,
+  full.names = T
+)
+raster_files
+
+# 3. LOAD FOREST COVER
+#---------------------
+
+forest_cover <- lapply(raster_files, terra::rast)
+forest_cover_mosaic <- do.call(terra::mosaic, forest_cover) 
+
+plot(forest_cover_mosaic)
+plot(sf::st_geometry(country_borders), add = T)
+
+# 4. CROP RASTER
+#---------------
+get_forest_cover_cropped <- function() {
+  country_borders_vect <- terra::vect(
+    country_borders
+  )
+  forest_cover_cropped <- terra::crop(
+    forest_cover_mosaic, country_borders_vect,
+    snap = "in", mask = T
+  )
+  
+  return(forest_cover_cropped)
+}
+# 5. RASTER TO DATAFRAME
+#-----------------------
+forest_cover_df <- forest_cover_cropped |>
+  as.data.frame(xy = T)
+
+names(forest_cover_df)
+names(forest_cover_df)[3] <- "percent_cover"
+summary(forest_cover_df)
+
+# Adjusting the range of values in the forest cover data by square root 
+# Aplicando logaritmo para comprimir el rango
+forest_cover_df$altura_transformada <- sqrt(forest_cover_df$percent_cover + 1)
+
+# Get summary of the values of altura_transformada
+summary_val <- summary(forest_cover_df$altura_transformada)
+min_val <- min(forest_cover_df$altura_transformada)
+max_val <- max(forest_cover_df$altura_transformada)
+limits <- c(min_val, max_val)
+
+# 6. BREAKS
+
+breaks <- seq(from = min_val, to = max_val, by = 9)
+
+# 7. COLORS
+# Definir la paleta de colores
+cols <- rev(c("#276604", "#386c0a", "#477311", "#557917",
+              "#63801e", "#708625", "#7d8c2d", "#8a9335",
+              "#97993d", "#a3a046", "#b0a650", "#bcad5b",
+              "#c8b366", "#d3ba73", "#dec180", "#e8c88f",
+              "#f1d0a0", "#f9d8b2", "#fee0c6", "#ffeadb"))
+texture <- colorRampPalette(cols)(256)
+
+# 8. GGPLOT2
+#-----------
+
+p <- ggplot(forest_cover_df) +
+      geom_raster(aes(x = x, y = y, fill = altura_transformada)) +
+      scale_fill_gradientn(
+        name = "% de área",
+        colours = texture,
+        breaks = breaks,
+        limits = limits
+      ) +
+      coord_sf(crs = crsLONGLAT) +
+      guides(
+        fill = guide_legend(
+          direction = "horizontal",
+          keyheight = unit(1.25, units = "mm"),
+          keywidth = unit(5, units = "mm"),
+          title.position = "top",
+          label.position = "bottom",
+          nrow = 1,
+          byrow = T
+        )
+      ) +
+      theme_minimal() +
+      theme(
+        axis.line = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.position = "top",
+        legend.title = element_text(size = 7, color = "grey10"),
+        legend.text = element_text(size = 5, color = "grey10"),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = "white", size = 0),
+        plot.background = element_rect(fill = "white", color = NA),
+        panel.background = element_rect(fill = "white", color = NA),
+        legend.background = element_rect(fill = "white", color = NA),
+        plot.margin = unit(c(t = 0, r = 0, b = 0, l = 0), "lines")
+      ) +
+      labs(
+        title = "",
+        subtitle = "",
+        caption = "",
+        x = "",
+        y = ""
+      )
+    
+# 9. RAYSHADER
+#-------------
+#dimensiones de raster
+w <- ncol(forest_cover_cropped)
+h <- nrow(forest_cover_cropped)
+
+#########
+rayshader::plot_gg(
+  ggobj = p,
+  multicore = T,
+  width = w / 1000,
+  height = h / 1000,
+  windowsize = c(800, 800),
+  offset_edges = T,
+  shadow_intensity = .99,
+  sunangle = 135,
+  phi = 30,
+  theta = -30
+)
+
+#para cerrar la vista 3d
+rgl::close3d()
+#########
+
+#edirt byron
+
+rayshader::plot_gg(
+  ggobj = p,
+  multicore = T,
+  width = w / 1000,
+  height = h / 1000,
+  windowsize = c(1920, 1080),
+  offset_edges = T,
+  shadow_intensity = .81, # Ajustado para una mayor intensidad de sombras
+  sunangle = 60,
+  phi = 30,
+    )
+
+#cambiando con la ventana abierta el zoom y el angulo del objeto 3d
+rayshader::render_camera(zoom = .3)
+rayshader::render_camera(zoom = .4)
+rayshader::render_camera(zoom = .5, phi = 85)
+rayshader::render_camera(zoom = .5, phi = 85, theta = 0)
+
+
+# 10. RENDER
+#-------------
+# ?rayshader::render_highquality
+
+rayshader::render_highquality(
+  filename = "ec_677.png",
+  lightintensity = c(300, 200), # reduce the intensity of the light
+  lightdirection = c(70, 115), # keep the light direction the same
+  lightaltitude = c(20, 40), # reduce the altitude of the light
+  preview = T,
+  width = w * 2, # increase the resolution of the image
+  height = h * 2, # increase the resolution of the image
+  parallel = T,
+  interactive = F,
+  )
+
+###render milos example
+
+rayshader::render_highquality(
+    filename = "take_4.png",
+    lightintensity = c(750, 500),
+    lightdirection = c(135, 115),
+    lightaltitude = c(30, 45),
+    preview = T,
+    width = w * .85,
+    height = h * .85,
+    parallel = T,
+    interactive = F
+)
+
+
+# BONUS: ANNOTATE MAP
+#--------------------
+install.packages("magick")
+library(magick)
+
+# load map
+
+map1 <- magick::image_read("ec_677.png")
+
+# Set text color
+title_color <- cols[4]
+text_color <- "grey20"
+
+# Title
+
+map2 <- magick::image_annotate(
+  map1, "Covertura forestal en 2019",
+  font = "Georgia",
+  color = alpha(title_color, .5),
+  size = 250, gravity = "northwest",
+  location = "+50+300"
+)
+#subtitle
+map3 <- magick::image_annotate(
+  map2, "ECUADOR",
+  font = "Georgia",
+  color = title_color,
+  size = 500, gravity = "northwest",
+  location = "+100+800", weight = 600
+)
+
+# caption 1 - author
+map4 <- magick::image_annotate(
+  map3, "©2023 Byron J. Moreno (https://www.linkedin.com/in/byronjm/)",
+  font = "Georgia",
+  color = alpha(text_color, .75),
+  size = 100, gravity = "southeast",
+  location = "+100+200"
+)
+
+# caption 2 - data source
+
+map5 <- magick::image_annotate(
+  map4, "Data: Copernicus Global Land Service: Land Cover 100m",
+  font = "Georgia",
+  color = alpha(text_color, .75),
+  size = 100, gravity = "southeast",
+  location = "+100+100"
+)
+
+magick::image_write(
+  map5,
+  "ggg.png"
+)
+
